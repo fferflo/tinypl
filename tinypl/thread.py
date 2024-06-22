@@ -48,7 +48,7 @@ class queue(pipe.Pipe):
 
     @property
     def fill(self):
-        return self.q.qsize()
+        return float(min(max(self.q.qsize(), 0), self.maxsize)) / self.maxsize
 
     @property
     def workers(self):
@@ -151,4 +151,4 @@ class mutex(pipe.Pipe):
 
     def _next(self):
         with self.lock:
-            return next(self.input)
+            return pipe._next(self.input)

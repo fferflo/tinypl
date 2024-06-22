@@ -82,6 +82,8 @@ class IteratorPipe(Pipe):
         self.iterator = None
 
     def _next(self):
+        if self.iterator is None:
+            raise StopIteration
         return Item(self.iterator.__next__())
 
 def wrap(pipe_or_iterator):
