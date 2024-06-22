@@ -1,9 +1,10 @@
 from . import pipe
 from .item import Marker
-import threading, traceback, queue, os, time, sys
+import threading, traceback, queue, os, time, sys, contextlib
 import tinypl as pl
 import multiprocessing
 import threadpoolctl
+import multiprocessing.shared_memory
 
 class StopSignal:
     pass
@@ -17,6 +18,240 @@ class WorkerEndTimeoutException(Exception):
     pass
 class WorkerException(Exception):
     pass
+
+class RWLock(object):
+    def __init__(self):
+        self.w_lock = threading.Lock()
+        self.num_r_lock = threading.Lock()
+        self.num_r = 0
+
+    def r_acquire(self):
+        self.num_r_lock.acquire()
+        self.num_r += 1
+        if self.num_r == 1:
+            self.w_lock.acquire()
+        self.num_r_lock.release()
+
+    def r_release(self):
+        assert self.num_r > 0
+        self.num_r_lock.acquire()
+        self.num_r -= 1
+        if self.num_r == 0:
+            self.w_lock.release()
+        self.num_r_lock.release()
+
+    @contextlib.contextmanager
+    def r_locked(self):
+        try:
+            self.r_acquire()
+            yield
+        finally:
+            self.r_release()
+
+    def w_acquire(self, blocking=True):
+        return self.w_lock.acquire(blocking=blocking)
+
+    def w_release(self):
+        self.w_lock.release()
+
+    @contextlib.contextmanager
+    def w_locked(self):
+        try:
+            self.w_acquire()
+            yield
+        finally:
+            self.w_release()
+
+import pickle
+import numpy as np
+
+class readwrite:
+    @staticmethod
+    def make(src):
+        if isinstance(src, (list, tuple)):
+            return readwrite.sequence(src)
+        elif isinstance(src, np.ndarray):
+            return readwrite.numpy(src)
+        else:
+            return readwrite.pickle(src)
+
+    @staticmethod
+    def read(src, aux):
+        assert isinstance(aux, tuple) and len(aux) == 2
+        return aux[0].read(src, aux[1])
+
+    class sequence:
+        def __init__(self, x):
+            self.readwrites = [readwrite.make(s) for s in x]
+            self.aux = (type(self), (type(x), [rw.aux for rw in self.readwrites]))
+
+        def __len__(self):
+            return sum(len(rw) for rw in self.readwrites)
+
+        def write(self, dest):
+            idx = 0
+            for rw in self.readwrites:
+                rw.write(dest[idx:idx + len(rw)])
+                idx += len(rw)
+
+        @staticmethod
+        def read(src, aux):
+            seq_type, rw_auxs = aux
+            result = []
+            idx = 0
+            for rw, aux in zip(self.readwrites, rw_auxs):
+                result.append(rw.read(src[idx:idx + len(rw)], aux))
+                idx += len(rw)
+            return seq_type(result)
+
+    class numpy:
+        def __init__(self, src):
+            self.src = src
+            self.aux = (type(self), (src.shape, src.dtype))
+
+        def __len__(self):
+            return self.src.nbytes
+        
+        def write(self, dest):
+            np.ndarray(self.src.shape, dtype=self.src.dtype, buffer=dest)[:] = self.src
+
+        @staticmethod
+        def read(src, aux):
+            shape, dtype = aux
+            return np.ndarray(shape, dtype=dtype, buffer=src)
+
+    class pickle:
+        def __init__(self, src):
+            self.src = pickle.dumps(src)
+            self.aux = (type(self), None)
+
+        def __len__(self):
+            return len(self.src)
+
+        def write(self, dest):
+            dest[:] = self.src
+
+        @staticmethod
+        def read(src, aux):
+            return pickle.loads(src)
+
+class SharedMemoryRingBuffer:
+    class Item:
+        def __init__(self, idx, begin, end, aux):
+            assert end > begin
+            self.idx = idx
+            self.begin = begin
+            self.end = end
+            self.aux = aux
+
+    def __init__(self, size):
+        if os.name != "posix":
+            raise NotImplementedError("SharedMemoryRingBuffer is only supported on POSIX systems.")
+        self.shm = multiprocessing.shared_memory.SharedMemory(create=True, size=size)
+        self.shm.unlink() # Unlink so that shared memory is freed when this process dies
+
+        self.size = size
+
+        self.lock = multiprocessing.Lock()
+        self.begin = multiprocessing.Value("q", self.size)
+        self.end = multiprocessing.Value("q", 0)
+        self.next_write_idx = multiprocessing.Value("q", 0)
+        self.read_event = multiprocessing.Event()
+        self.read_event.set()
+        self.item_queue = multiprocessing.Queue()
+        self.next_read_idx = 0
+        self.next_items = []
+        self.returned_items = []
+
+    def close(self):
+        self.item_queue.close()
+        self.shm.close()
+
+    def num_stored_items(self):
+        with self.lock:
+            return self.next_write_idx.value - self.next_read_idx
+
+    def free_ratio(self):
+        with self.lock:
+            end = self.end.value
+            begin = self.begin.value
+            if begin < end:
+                return (begin + self.size - end) / self.size
+            else:
+                return (begin - end) / self.size
+
+    def write(self, data):
+        data = readwrite.make(data)
+        if len(data) > self.size:
+            raise ValueError("Data too large to fit in buffer")
+        while True:
+            with self.lock:
+                begin = self.begin.value
+                end = self.end.value
+                if begin < end and self.size - end >= len(data):
+                    # Data fits after begin and end
+                    item_begin = end
+                elif begin < end and begin >= len(data):
+                    # Data fits before begin and end, possible leaving a gap at the end
+                    item_begin = 0
+                elif begin > end and begin - end >= len(data):
+                    # Data fits between end and begin
+                    item_begin = end
+                else:
+                    # Data does not fit
+                    item_begin = None
+
+                if item_begin is not None:
+                    # Write item
+                    item = self.Item(self.next_write_idx.value, item_begin, item_begin + len(data), aux=data.aux)
+                    self.end.value = item.end % self.size
+                    self.next_write_idx.value = item.idx + 1
+                    break
+
+            # Failed to write, wait for read
+            self.read_event.wait(5.0)
+            self.read_event.clear()
+
+        data.write(self.shm.buf[item.begin:item.end])
+        self.item_queue.put(item)
+        return item
+
+    def read(self, item):
+        if not isinstance(item, self.Item):
+            raise ValueError("Invalid item")
+    
+        # Update items
+        with self.lock:
+            while not any(x.idx == item.idx for x in self.next_items):
+                self.next_items.append(self.item_queue.get())
+            self.next_items.sort(key=lambda x: x.idx)
+
+        # Read and unpickle data
+        data = readwrite.read(self.shm.buf[item.begin:item.end], item.aux)
+
+        # Remove item from queue
+        with self.lock:
+            self.next_items = [x for x in self.next_items if x.idx != item.idx]
+            item.aux = None
+            self.returned_items.append(item)
+            self.returned_items.sort(key=lambda x: x.idx)
+
+            # Update begin if possible
+            updated = False
+            while len(self.returned_items) > 0 and self.returned_items[0].idx == self.next_read_idx:
+                updated = True
+                item = self.returned_items.pop(0)
+                self.begin.value = item.end
+                self.next_read_idx += 1
+            if self.begin.value == self.end.value:
+                # Buffer is empty
+                self.begin.value = self.size
+                self.end.value = 0
+            if updated:
+                self.read_event.set() # Signal that a new item can be written
+
+        return data
+
 
 class map(pipe.Pipe):
     WorkerEndTimeoutException = WorkerEndTimeoutException
@@ -51,6 +286,29 @@ class map(pipe.Pipe):
         self.force_stop = self.ctx.Value("b", 0)
         self.exception = None
 
+        self.output_queue_lock = RWLock()
+
+        # Start output processes
+        self.started_output_workers = self.ctx.Value("i", 0)
+        self.running_output_workers = self.ctx.Value("i", 0)
+        self.num_output_workers_cleanup = self.ctx.Value("i", 0)
+        self.num_output_workers_flushed = self.ctx.Value("i", 0)
+        self.output_workers = []
+        self.num_output_workers = workers
+        self.all_output_workers_started = self.ctx.Event()
+        self.all_output_workers_flushed = self.ctx.Event()
+        for _ in range(workers):
+            worker = self.ctx.Process(target=map._work_output, args=(self.input_queue, self.output_queue, self.force_stop, self.started_output_workers, self.running_output_workers, self.num_output_workers_cleanup, self.num_output_workers_flushed, func, on_worker_error, self.all_output_workers_started, self.all_output_workers_flushed, workers, force_single_thread), daemon=True)
+            worker.start()
+            self.output_workers.append(worker)
+
+        start = time.time()
+        while not self.all_output_workers_started.wait(0.5):
+            if time.time() - start > start_timeout:
+                raise WorkerStartTimeoutException(f"Timeout when waiting for output workers to start. {self.running_input_workers} input workers and {self.running_output_workers.value} output workers are running.")
+
+        self.stop_lock = threading.Lock()
+
         # Start input threads
         self.input_lock = threading.Lock()
         self.input_workers_num = input_workers
@@ -70,25 +328,6 @@ class map(pipe.Pipe):
         while not self.all_input_workers_started.wait(0.5):
             if time.time() - start > start_timeout:
                 raise WorkerStartTimeoutException(f"Timeout when waiting for input workers to start. {self.running_input_workers} input workers and {self.running_output_workers.value} output workers are running.")
-
-        # Start output processes
-        self.started_output_workers = self.ctx.Value("i", 0)
-        self.running_output_workers = self.ctx.Value("i", 0)
-        self.stopped_output_workers = self.ctx.Value("i", 0)
-        self.output_workers = []
-        self.all_output_workers_started = self.ctx.Event()
-        self.all_output_workers_stopped = self.ctx.Event()
-        for _ in range(workers):
-            worker = self.ctx.Process(target=map._work_output, args=(self.input_queue, self.output_queue, self.force_stop, self.started_output_workers, self.running_output_workers, self.stopped_output_workers, func, on_worker_error, self.all_output_workers_started, self.all_output_workers_stopped, workers, force_single_thread), daemon=True)
-            worker.start()
-            self.output_workers.append(worker)
-
-        start = time.time()
-        while not self.all_output_workers_started.wait(0.5):
-            if time.time() - start > start_timeout:
-                raise WorkerStartTimeoutException(f"Timeout when waiting for output workers to start. {self.running_input_workers} input workers and {self.running_output_workers.value} output workers are running.")
-
-        self.stop_lock = threading.Lock()
 
     @property
     def input_fill(self):
@@ -138,13 +377,14 @@ class map(pipe.Pipe):
                 self.exception = WorkerException("Input worker got exception:\n" + traceback.format_exc())
                 self.force_stop.value = 1
         with self.input_lock:
-            if self.stopped_input_workers == self.input_workers_num - 1:
-                self.input_queue.put(StopSignal())
             self.running_input_workers -= 1
             self.stopped_input_workers += 1
+            if self.stopped_input_workers == self.input_workers_num:
+                for _ in range(self.num_output_workers):
+                    self.input_queue.put(StopSignal())
 
     @staticmethod
-    def _work_output(input_queue, output_queue, force_stop, started_workers, running_workers, stopped_workers, func, on_worker_error, all_output_workers_started, all_output_workers_stopped, workers_num, force_single_thread):
+    def _work_output(input_queue, output_queue, force_stop, started_workers, running_workers, num_workers_cleanup, num_workers_flushed, func, on_worker_error, all_output_workers_started, all_output_workers_flushed, workers_num, force_single_thread):
         with running_workers.get_lock():
             running_workers.value += 1
         with started_workers.get_lock():
@@ -194,36 +434,60 @@ class map(pipe.Pipe):
         else:
             work()
 
+        # Last process to reach this point will put a StopSignal on the output queue
+        with num_workers_cleanup.get_lock():
+            num_workers_cleanup.value += 1
+            put_stop_signal = num_workers_cleanup.value == workers_num
+
+        # All other processes will flush the output queue to ensure that items are inserted before the StopSignal
+        if not put_stop_signal:
+            output_queue.close()
+            output_queue.join_thread()
+        with num_workers_flushed.get_lock():
+            num_workers_flushed.value += 1
+            if num_workers_flushed.value == workers_num:
+                all_output_workers_flushed.set()
+
+        # The chosen process will wait for all other processes to flush the queue and then put the StopSignal
+        if put_stop_signal:
+            all_output_workers_flushed.wait()
+            output_queue.put(StopSignal())
+            output_queue.close()
+            output_queue.join_thread()
+
         with running_workers.get_lock():
             running_workers.value -= 1
-        with stopped_workers.get_lock():
-            if stopped_workers.value == workers_num - 1:
-                output_queue.put(StopSignal())
-            stopped_workers.value += 1
-            if stopped_workers.value == 0:
-                all_output_workers_stopped.set()
 
     def stop(self):
         with self.stop_lock:
             self.force_stop.value = 1
             self.input.stop()
+            try:
+                self.input_queue.put(StopSignal(), block=False)
+            except:
+                pass
 
             # Stop output workers
-            start_time = time.time()
-            while (not self.output_queue is None and not self.output_queue.empty()) or self.running_output_workers.value > 0:
-                if time.time() - start_time > self.end_timeout:
-                    raise WorkerEndTimeoutException(f"Timeout when waiting for output workers to finish. {self.running_input_workers} input workers and {self.running_output_workers.value} output workers still running, got {self.input_queue.qsize() if not self.input_queue is None else 0} items in input queue and {self.output_queue.qsize() if not self.output_queue is None else 0} items in output queue.")
+            with self.output_queue_lock.r_locked():
+                start_time = time.time()
+                while (not self.output_queue is None and not self.output_queue.empty()) or self.running_output_workers.value > 0:
+                    try:
+                        self.input_queue.put(StopSignal(), block=False)
+                    except:
+                        pass
+                    if time.time() - start_time > self.end_timeout:
+                        raise WorkerEndTimeoutException(f"Timeout when waiting for output workers to finish. {self.running_input_workers} input workers and {self.running_output_workers.value} output workers still running, got {self.input_queue.qsize() if not self.input_queue is None else 0} items in input queue and {self.output_queue.qsize() if not self.output_queue is None else 0} items in output queue.")
 
-                if not self.output_queue is None:
-                    while not self.output_queue.empty():
-                        try:
-                            item = self.output_queue.get(block=False)
-                            if isinstance(item, ExceptionSignal) and self.exception is None:
-                                self.exception = item.exception
-                        except:
-                            pass
+                    if not self.output_queue is None:
+                        while not self.output_queue.empty():
+                            try:
+                                item = self.output_queue.get(block=False)
+                                if isinstance(item, ExceptionSignal) and self.exception is None:
+                                    self.exception = item.exception
+                            except:
+                                pass
 
-                time.sleep(0.1)
+                    time.sleep(0.1)
 
             # Stop input workers
             while (not self.input_queue is None and not self.input_queue.empty()) or self.running_input_workers > 0:
@@ -238,21 +502,35 @@ class map(pipe.Pipe):
                             pass
 
                 time.sleep(0.1)
-    
+
             # Close handles
             for process in self.output_workers:
                 process.join(5.0)
                 if process.is_alive():
-                    # print("WARNING: Output worker did not stop in time, terminating it.")
+                    print("WARNING: Output worker did not stop in time, terminating it.")
                     process.terminate()
                     process.join(5.0)
                     if process.is_alive():
                         raise WorkerEndTimeoutException(f"Timeout when waiting for output worker to terminate.")
                 process.close()
             self.output_workers = []
+
             if not self.output_queue is None:
+                # Acquire write access to output_queue
+                while not self.output_queue_lock.w_acquire(blocking=False):
+                    with self.output_queue_lock.r_locked():
+                        try:
+                            self.output_queue.put(StopSignal(), block=False)
+                        except:
+                            pass
+
+                while not self.output_queue.full():
+                    self.output_queue.put(StopSignal())
                 self.output_queue.close()
+                self.output_queue.join_thread()
                 self.output_queue = None
+
+                self.output_queue_lock.w_release()
 
             for thread in self.input_workers:
                 thread.join(5.0)
@@ -273,15 +551,16 @@ class map(pipe.Pipe):
                 raise self.exception
             else:
                 raise StopIteration
-        if self.output_queue is None:
-            raise StopIteration
 
         # Retrieve item from queue
-        try:
-            packet = self.output_queue.get(timeout=self.warn_timeout if self.warn_timeout > 0 else None)
-        except queue.Empty:
-            print("Waited more than " + str(self.warn_timeout) + " seconds for multiprocessed output queue at:\n" + str(self.tb))
-            packet = self.output_queue.get()
+        with self.output_queue_lock.r_locked():
+            if self.output_queue is None:
+                raise StopIteration
+            try:
+                packet = self.output_queue.get(timeout=self.warn_timeout if self.warn_timeout > 0 else None)
+            except queue.Empty:
+                print("Waited more than " + str(self.warn_timeout) + " seconds for multiprocessed output queue at:\n" + str(self.tb))
+                packet = self.output_queue.get()
 
         # If exception was raised after pulling item, stop the pipeline and raise it
         if not self.exception is None:
