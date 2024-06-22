@@ -34,8 +34,8 @@ class map(pipe.Pipe):
         self.end_timeout = end_timeout
         self.tb = "".join(traceback.format_stack()[:-1])
         self.warn_timeout = warn_timeout
-        if not (on_worker_error == "exit" or on_worker_error == "forward"):
-            raise ValueError("on_worker_error parameter must be {exit|forward}")
+        if on_worker_error not in ["exit", "forward", "forward-and-print"]:
+            raise ValueError("on_worker_error parameter must be {exit|forward|forward-and-print}")
         self.on_worker_error = on_worker_error
         self.force_single_thread = force_single_thread
 
@@ -129,11 +129,12 @@ class map(pipe.Pipe):
                 else:
                     self.input_queue.put((item.get(), next_id))
         except:
-            if self.on_worker_error == "exit":
+            if self.on_worker_error in ["exit", "forward-and-print"]:
                 print("Input worker got exception:\n" + traceback.format_exc())
-                os._exit(-1)
+            if self.on_worker_error == "exit":
+                sys.exit(-1)
+                # os._exit(-1)
             else:
-                assert self.on_worker_error == "forward"
                 self.exception = WorkerException("Input worker got exception:\n" + traceback.format_exc())
                 self.force_stop.value = 1
         with self.input_lock:
@@ -179,11 +180,11 @@ class map(pipe.Pipe):
 
                     output_queue.put((value, item_id))
             except:
-                if on_worker_error == "exit":
+                if on_worker_error in ["exit", "forward-and-print"]:
                     print("Output worker got exception:\n" + traceback.format_exc())
+                if on_worker_error == "exit":
                     os._exit(-1)
                 else:
-                    assert on_worker_error == "forward"
                     output_queue.put(ExceptionSignal(WorkerException("Worker got exception:\n" + traceback.format_exc())))
                     force_stop.value = 1
 

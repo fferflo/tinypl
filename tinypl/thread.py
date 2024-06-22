@@ -15,7 +15,7 @@ class queue(pipe.Pipe):
     WorkerEndTimeoutException = WorkerEndTimeoutException
     WorkerException = WorkerException
 
-    def __init__(self, input, workers, maxsize=None, end_timeout=30.0, warn_timeout=0, on_worker_error="forward"):
+    def __init__(self, input, workers, maxsize=None, end_timeout=30.0, warn_timeout=0, on_worker_error="exit"):
         super().__init__()
         if maxsize is None:
             maxsize = 2 * workers
@@ -25,8 +25,8 @@ class queue(pipe.Pipe):
         self.end_timeout = end_timeout
         self.tb = "".join(traceback.format_stack()[:-1])
         self.warn_timeout = warn_timeout
-        if not (on_worker_error == "exit" or on_worker_error == "forward"):
-            raise ValueError("on_worker_error parameter must be {exit|forward}")
+        if on_worker_error not in ["exit", "forward", "forward-and-print"]:
+            raise ValueError("on_worker_error parameter must be {exit|forward|forward-and-print}")
         self.on_worker_error = on_worker_error
 
         self.q = py_queue.Queue(maxsize)
@@ -63,8 +63,9 @@ class queue(pipe.Pipe):
                     break
                 self.q.put(item)
         except:
-            if self.on_worker_error == "exit":
+            if self.on_worker_error in ["exit", "forward-and-print"]:
                 print("Worker got exception:\n" + traceback.format_exc())
+            if self.on_worker_error == "exit":
                 os._exit(-1)
             else:
                 if self.exception is None:
