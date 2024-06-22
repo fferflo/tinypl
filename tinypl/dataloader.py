@@ -4,16 +4,24 @@ import numpy as np
 
 class sampler:
     @staticmethod
-    def sequential(dataset):
+    def sequential(dataset, epochs=None):
+        e = 0
         while True:
             yield range(len(dataset))
+            e += 1
+            if not epochs is None and e == epochs:
+                break
 
     @staticmethod
-    def shuffle(dataset, rng=random):
+    def shuffle(dataset, rng=random, epochs=None):
+        e = 0
         while True:
             indices = list(range(len(dataset)))
             rng.shuffle(indices)
             yield indices
+            e += 1
+            if not epochs is None and e == epochs:
+                break
 
 def load(dataset, batchsize, collate_fn=lambda batch: batch, map=pl.map, collate_map=None, sampler=None, epoch_end_mode="ignore"):
     if sampler is None:
@@ -48,18 +56,32 @@ def load(dataset, batchsize, collate_fn=lambda batch: batch, map=pl.map, collate
             order.maxsize = pipe.maxsize
         pipe = pl.order.load(pipe, order)
     else:
-        # Yield one item per worker, collate afterwards
-        pipe = order = pl.order.save(pipe, maxsize=1)
-        pipe = map(pipe, dataset.__getitem__)
-        if "maxsize" in dir(pipe):
-            order.maxsize = pipe.maxsize
-        pipe = pl.order.load(pipe, order)
+        if map == pl.map:
+            # Yield items and collate per worker
+            pipe = pl.partition(pipe, batchsize, markers="after", split_on_marker=split_on_marker)
 
-        pipe = pl.partition(pipe, batchsize, markers="after", split_on_marker=split_on_marker)
-        pipe = order = pl.order.save(pipe, maxsize=1)
-        pipe = collate_map(pipe, collate_fn)
-        if "maxsize" in dir(pipe):
-            order.maxsize = pipe.maxsize
-        pipe = pl.order.load(pipe, order)
+            pipe = order = pl.order.save(pipe, maxsize=1)
+            pipe = pl.map(pipe, np.asarray)
+            def load(indices):
+                return [dataset[index] for index in indices]
+            pipe = pl.map(pipe, load)
+            pipe = collate_map(pipe, collate_fn)
+            if "maxsize" in dir(pipe):
+                order.maxsize = pipe.maxsize
+            pipe = pl.order.load(pipe, order)
+        else:
+            # Yield one item per worker, collate afterwards
+            pipe = order = pl.order.save(pipe, maxsize=1)
+            pipe = map(pipe, dataset.__getitem__)
+            if "maxsize" in dir(pipe):
+                order.maxsize = pipe.maxsize
+            pipe = pl.order.load(pipe, order)
+
+            pipe = pl.partition(pipe, batchsize, markers="after", split_on_marker=split_on_marker)
+            pipe = order = pl.order.save(pipe, maxsize=1)
+            pipe = collate_map(pipe, collate_fn)
+            if "maxsize" in dir(pipe):
+                order.maxsize = pipe.maxsize
+            pipe = pl.order.load(pipe, order)
 
     return pipe
