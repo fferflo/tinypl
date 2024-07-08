@@ -14,4 +14,5 @@ setup(
         "threadpoolctl",
     ],
     license="MIT",
+    url="https://github.com/fferflo/tinypl",
 )
