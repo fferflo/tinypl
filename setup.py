@@ -14,5 +14,4 @@ setup(
         "threadpoolctl",
     ],
     license="MIT",
-    zip_safe=False,
 )
