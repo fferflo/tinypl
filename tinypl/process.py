@@ -62,17 +62,22 @@ class RWLock(object):
         finally:
             self.w_release()
 
+import types
 import pickle
 import numpy as np
 
 class readwrite:
     @staticmethod
-    def make(src):
+    def make(src, allow_pickle=True):
         if isinstance(src, (list, tuple)):
-            return readwrite.sequence(src)
+            return readwrite.sequence(src, allow_pickle=allow_pickle)
+        elif isinstance(src, (dict, types.SimpleNamespace)):
+            return readwrite.mapping(src, allow_pickle=allow_pickle)
         elif isinstance(src, np.ndarray):
             return readwrite.numpy(src)
         else:
+            if not allow_pickle:
+                raise ValueError(f"Value of type {type(src)} must be pickled")
             return readwrite.pickle(src)
 
     @staticmethod
@@ -81,9 +86,9 @@ class readwrite:
         return aux[0].read(src, aux[1])
 
     class sequence:
-        def __init__(self, x):
-            self.readwrites = [readwrite.make(s) for s in x]
-            self.aux = (type(self), (type(x), [rw.aux for rw in self.readwrites]))
+        def __init__(self, x, allow_pickle):
+            self.readwrites = [readwrite.make(s, allow_pickle) for s in x]
+            self.aux = (type(self), (type(x), [(rw.aux, len(rw)) for rw in self.readwrites]))
 
         def __len__(self):
             return sum(len(rw) for rw in self.readwrites)
@@ -99,10 +104,39 @@ class readwrite:
             seq_type, rw_auxs = aux
             result = []
             idx = 0
-            for rw, aux in zip(self.readwrites, rw_auxs):
-                result.append(rw.read(src[idx:idx + len(rw)], aux))
-                idx += len(rw)
+            for rw_aux, rw_len in rw_auxs:
+                result.append(rw.read(src[idx:idx + rw_len], aux))
+                idx += rw_len
+            assert idx == len(src)
             return seq_type(result)
+
+    class mapping:
+        def __init__(self, x, allow_pickle):
+            dict_type = type(x)
+            if isinstance(x, types.SimpleNamespace):
+                x = vars(x)
+            self.readwrites = {k: readwrite.make(v, allow_pickle) for k, v in x.items()}
+            self.aux = (type(self), (dict_type, {k: (rw.aux, len(rw)) for k, rw in self.readwrites.items()}))
+
+        def __len__(self):
+            return sum(len(rw) for rw in self.readwrites.values())
+
+        def write(self, dest):
+            idx = 0
+            for rw in self.readwrites.values():
+                rw.write(dest[idx:idx + len(rw)])
+                idx += len(rw)
+        
+        @staticmethod
+        def read(src, aux):
+            dict_type, rw_auxs = aux
+            result = {}
+            idx = 0
+            for k, (rw_aux, rw_len) in rw_auxs.items():
+                result[k] = readwrite.read(src[idx:idx + rw_len], rw_aux)
+                idx += rw_len
+            assert idx == len(src)
+            return dict_type(**result)
 
     class numpy:
         def __init__(self, src):
@@ -113,12 +147,16 @@ class readwrite:
             return self.src.nbytes
         
         def write(self, dest):
-            np.ndarray(self.src.shape, dtype=self.src.dtype, buffer=dest)[:] = self.src
+            assert len(dest) == self.src.nbytes
+            dest = np.ndarray(self.src.shape, dtype=self.src.dtype, buffer=dest)
+            dest[:] = self.src
 
         @staticmethod
         def read(src, aux):
             shape, dtype = aux
-            return np.ndarray(shape, dtype=dtype, buffer=src)
+            result = np.copy(np.ndarray(shape, dtype=dtype, buffer=src))
+            assert result.nbytes == len(src)
+            return result
 
     class pickle:
         def __init__(self, src):
@@ -144,15 +182,17 @@ class SharedMemoryRingBuffer:
             self.end = end
             self.aux = aux
 
-    def __init__(self, size):
+    def __init__(self, size, allow_pickle=True, verbose=False):
         if os.name != "posix":
             raise NotImplementedError("SharedMemoryRingBuffer is only supported on POSIX systems.")
         self.shm = multiprocessing.shared_memory.SharedMemory(create=True, size=size)
         self.shm.unlink() # Unlink so that shared memory is freed when this process dies
 
+        self.allow_pickle = allow_pickle
         self.size = size
+        self.verbose = verbose
 
-        self.lock = multiprocessing.Lock()
+        self.lock = multiprocessing.RLock()
         self.begin = multiprocessing.Value("q", self.size)
         self.end = multiprocessing.Value("q", 0)
         self.next_write_idx = multiprocessing.Value("q", 0)
@@ -167,10 +207,12 @@ class SharedMemoryRingBuffer:
         self.item_queue.close()
         self.shm.close()
 
+    @property
     def num_stored_items(self):
         with self.lock:
             return self.next_write_idx.value - self.next_read_idx
 
+    @property
     def free_ratio(self):
         with self.lock:
             end = self.end.value
@@ -181,20 +223,20 @@ class SharedMemoryRingBuffer:
                 return (begin - end) / self.size
 
     def write(self, data):
-        data = readwrite.make(data)
+        data = readwrite.make(data, self.allow_pickle)
         if len(data) > self.size:
             raise ValueError("Data too large to fit in buffer")
         while True:
             with self.lock:
                 begin = self.begin.value
                 end = self.end.value
-                if begin < end and self.size - end >= len(data):
+                if begin < end and self.size - end > len(data):
                     # Data fits after begin and end
                     item_begin = end
-                elif begin < end and begin >= len(data):
+                elif begin < end and begin > len(data):
                     # Data fits before begin and end, possible leaving a gap at the end
                     item_begin = 0
-                elif begin > end and begin - end >= len(data):
+                elif begin > end and begin - end > len(data):
                     # Data fits between end and begin
                     item_begin = end
                 else:
@@ -213,20 +255,21 @@ class SharedMemoryRingBuffer:
             self.read_event.clear()
 
         data.write(self.shm.buf[item.begin:item.end])
+
         self.item_queue.put(item)
         return item
 
     def read(self, item):
         if not isinstance(item, self.Item):
-            raise ValueError("Invalid item")
-    
+            raise ValueError("Invalid item", self.num_stored_items)
+
         # Update items
         with self.lock:
             while not any(x.idx == item.idx for x in self.next_items):
-                self.next_items.append(self.item_queue.get())
+                self.next_items.append(self.item_queue.get()) # TODO: detect deadlock if this times out, but shm is full
             self.next_items.sort(key=lambda x: x.idx)
 
-        # Read and unpickle data
+        # Read and deserialize data
         data = readwrite.read(self.shm.buf[item.begin:item.end], item.aux)
 
         # Remove item from queue
@@ -247,6 +290,8 @@ class SharedMemoryRingBuffer:
                 # Buffer is empty
                 self.begin.value = self.size
                 self.end.value = 0
+                assert len(self.returned_items) == 0
+                assert self.next_read_idx == self.next_write_idx.value, f"{self.next_read_idx} == {self.next_write_idx.value}"
             if updated:
                 self.read_event.set() # Signal that a new item can be written
 
@@ -331,11 +376,17 @@ class map(pipe.Pipe):
 
     @property
     def input_fill(self):
-        return float(min(max(self.input_queue.qsize(), 0), self.input_maxsize)) / self.input_maxsize
+        if self.input_queue is None:
+            return 0.0
+        else:
+            return float(min(max(self.input_queue.qsize(), 0), self.input_maxsize)) / self.input_maxsize
 
     @property
     def fill(self):
-        return float(min(max(self.output_queue.qsize(), 0), self.output_maxsize)) / self.output_maxsize
+        if self.output_queue is None:
+            return 0.0
+        else:
+            return float(min(max(self.output_queue.qsize(), 0), self.output_maxsize)) / self.output_maxsize
 
     @property
     def workers(self):
