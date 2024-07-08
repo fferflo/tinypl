@@ -15,8 +15,6 @@
     3. [Multi-threading & multi-processing](#multi-threading-multi-processing)
     4. [Markers](#markers)
     5. [Ordering](#ordering)
-3. [Applications](#applications)
-    1. [Dataloader for Deep Learning](#dataloader-for-deep-learning)
 
 ## Install
 
