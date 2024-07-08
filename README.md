@@ -21,7 +21,7 @@
 ## Install
 
 ```
-pip install git+https://github.com/fferflo/tinypl.git
+pip install tinypl
 ```
 
 ## Usage
