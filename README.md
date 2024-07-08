@@ -183,7 +183,7 @@ pipe = range(100)
 
 def stage1(i):
     # Create a large numpy array in this process
-    x = np.random.rand(1024, 1024, 200) # 200 MB
+    x = np.random.randint(0, 255, size=(1024, 1024, 200), dtype=np.uint8) # 200 MB
 
     # Serialize and move the array to shared memory. The return value is a reference to the shared memory
     # that can be passed between processes cheaply and can be deserialized later
